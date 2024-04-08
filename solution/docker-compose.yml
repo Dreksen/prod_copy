@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:latest
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: example
+      POSTGRES_DATABASE: admin
+    container_name: db
+
+  web:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_started
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: example
+      POSTGRES_DATABASE: admin
+      RANDOM_SECRET: qwertyuiop
+      POSTGRES_HOST: db
+      SECRET_KEY: severalshorwordbetterthanonelongone
+
