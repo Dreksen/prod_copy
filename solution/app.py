@@ -1,31 +1,31 @@
-import datetime
-# from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
-import bcrypt
+import os
 import re
-from flask import Flask, request, jsonify
-# from flask_bcrypt import Bcrypt
 import jwt
+import bcrypt
+import datetime
+import psycopg2
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify
+
+# from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
+# from flask_bcrypt import Bcrypt
 # from flask_sqlalchemy import SQLAlchemy
 # from sqlalchemy.exc import IntegrityError
 
-import psycopg2
 
 app = Flask(__name__)
-import os
-
-# bcrypt = Bcrypt(app)
-print(os.getenv('POSTGRES_DATABASE'))
+load_dotenv()
 try:
     conn = psycopg2.connect(host=os.getenv('POSTGRES_HOST'), database=os.getenv('POSTGRES_DATABASE'),
-                            user=os.getenv('POSTGRES_USER'), password=os.getenv('POSTGRES_PASSWORD'))
-    # conn = psycopg2.connect(host='db', database='admin',
-    #                         user='admin', password='example', port=5432)
-except Exception as e:
-    print(e)
+                            user=os.getenv('POSTGRES_USER'), password=os.getenv('POSTGRES_PASSWORD'),
+                            port=os.getenv('POSTGRES_PORT'))
+except psycopg2.Error as e:
+    print("Ошибка подключения к базе данных:", e)
     exit(0)
 
-cursor = conn.cursor()
-cursor.execute('''
+# conn.autocommit = True
+with conn.cursor() as cursor:  # creating countries table
+    cursor.execute('''
 CREATE TABLE IF NOT EXISTS countries (
     id SERIAL PRIMARY KEY,
     name TEXT,
@@ -288,7 +288,9 @@ BEGIN
           ('Zimbabwe','ZW','ZWE','Africa');
     END IF;
 END $$;''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS users(
+
+with conn.cursor() as cursor:  # creating users table
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users(
     id SERIAL PRIMARY KEY,
     login VARCHAR(30) UNIQUE NOT NULL,
     email VARCHAR(50) UNIQUE NOT NULL,
@@ -300,7 +302,8 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS users(
     token VARCHAR(200)
 );''')
 
-class User:
+
+class Profile:
     def __init__(self, login, email, password, countryCode, isPublic, phone=None, image=None):
         self.login = login
         self.email = email
@@ -311,39 +314,13 @@ class User:
         self.image = image
 
 
-@app.route('/api/ping', methods=['GET'])
-def send():
-    try:
-        return jsonify({"status": "ok"}), 200
-    except:
-        return jsonify({"status": "not_ok"}), 500
-
-# Эндпоинт для получения списка стран
-@app.route('/api/countries', methods=['GET'])
-def get_countries():
-    region = request.args.get('region')  # Параметр фильтрации по региону, если передан
-    cursor = conn.cursor()
-    if region:
-        cursor.execute("SELECT name, alpha2, alpha3, region FROM countries WHERE region = %s", (region,))
-    else:
-        cursor.execute("SELECT name, alpha2, alpha3, region FROM countries")
-    countries = cursor.fetchall()
-    cursor.close()
-    return jsonify(countries), 200
-
-# Эндпоинт для получения информации о стране по её уникальному двухбуквенному коду
-
 def get_country_by_alpha(alpha_code):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM countries WHERE alpha2 = %s", (alpha_code, ))
-        country = cur.fetchone()
-        cur.close()
-        if not country:
-            return jsonify('invalid alpha'), 404
-        return jsonify(country), 200
-    except Exception as e:
-        return jsonify('error', 'invalid alpha'), 404
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT * FROM countries WHERE alpha2 = %s", (alpha_code,))
+        country = cursor.fetchone()
+    if not country:
+        return jsonify('invalid alpha'), 404
+    return jsonify(country), 200
 
 
 # Генерация токена
@@ -354,6 +331,13 @@ def generate_token(user_id):
     }
     token = jwt.encode(payload, os.getenv('RANDOM_SECRET'), algorithm='HS256')
     return token.decode('utf-8')
+
+
+def get_actual_regions():
+    with conn.cursor() as cursor:
+        cursor.execute('''SELECT DISTINCT region FROM countries;
+''')
+        return cursor.fetchall
 
 
 def generate_hash(password):
@@ -371,15 +355,57 @@ def authenticate(password, hash):
     # конвертируем все из строки в байты
     password_bytes = password.encode("utf-8")
     hash_bytes = hash.encode("utf-8")
-    # соль автоматически (криптографически) «обнаруживается» в хэше, поэтому во время проверки ее не надо указывать отдельно
     result = bcrypt.checkpw(password_bytes, hash_bytes)
-
     return result
+
+
+@app.route('/api/ping', methods=['GET'])
+def send():
+    return jsonify({"status": "ok"}), 200
+
+
+# Эндпоинт для получения списка стран
+@app.route('/api/countries', methods=['GET'])
+def get_countries():
+    regions = request.args.get('regions')  # Параметр фильтрации по регионам, если передан
+    if regions:
+        print(regions)
+        regions_list = regions.split(',')
+        # Проверка введенных регионов
+        actual_regions = get_actual_regions()
+        for region in regions_list:
+            if region not in actual_regions:
+                return jsonify({'message': f'Region "{region}" is invalid'}), 400
+
+        # Генерация строки с плейсхолдерами для каждого региона
+        placeholders = ', '.join(['%s' for _ in regions_list])
+        # Формируем строку запроса SQL с оператором IN и подставляем значения регионов
+        query = f"SELECT name, alpha2, alpha3, region FROM countries WHERE region IN ({placeholders}) ORDER BY alpha2"
+        with conn.cursor() as cursor:
+            cursor.execute(query, tuple(regions_list))
+            countries = cursor.fetchall()
+    else:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT name, alpha2, alpha3, region FROM countries ORDER BY alpha2")
+            countries = cursor.fetchall()
+    return jsonify(countries), 200
+
+
+# Эндпоинт для получения информации о стране по её уникальному двухбуквенному коду
+@app.route('/countries/<alpha2>', methods=['GET'])
+def get_country(alpha2):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT * FROM countries WHERE alpha2 = %s", (alpha2,))
+        country = cursor.fetchone()
+        if not country:
+            return jsonify({'message': 'Country not found'}), 404
+        return jsonify(country), 200
+
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     data = request.get_json()
-    cursor = conn.cursor()
+
     if data.get('login') is None:
         return jsonify({'error': 'Логин не указан'}), 400
     if data.get('email') is None:
@@ -391,7 +417,6 @@ def register():
     if data.get('isPublic') is None:
         return jsonify({'error': 'Флаг isPublic не указан'}), 400
 
-    # hashed_password = bcrypt.generate_password_hash(data['password'])
     hashed_password = generate_hash(data['password'])
 
     if not re.match('^[a-zA-Z0-9]+$', data['login']):
@@ -417,32 +442,33 @@ def register():
     if data.get('image') is not None:
         if len(data['image']) > 200:
             return jsonify({'error': 'Ссылка на изображение слишком длинная (не более 200 символов)'}), 400
-    cursor.execute("SELECT COUNT(*) FROM countries WHERE alpha2 = %s", (data['countryCode'],))
-    count = cursor.fetchone()[0]
-    if count == 0:
-        return jsonify({'error': 'Ошибка: Код страны не найден'}), 409
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM countries WHERE alpha2 = %s", (data['countryCode'],))
+        count = cursor.fetchone()[0]
+        if count == 0:
+            return jsonify({'error': 'Код страны не найден'}), 400
 
-    # Check if login or email already exists
-    cursor.execute("SELECT COUNT(*) FROM users WHERE login = %s;", (data['login'],))
-    count = cursor.fetchone()[0]
-    if count != 0:
-        return jsonify({'error': 'Login already exists'}), 409
+        # Check if login or email already exists
+        cursor.execute("SELECT COUNT(*) FROM users WHERE login = %s;", (data['login'],))
+        count = cursor.fetchone()[0]
+        if count != 0:
+            return jsonify({'error': 'Login already exists'}), 409
 
-    cursor.execute("SELECT COUNT(*) FROM users WHERE email = %s;", (data['email'],))
-    count = cursor.fetchone()[0]
-    if count != 0:
-        return jsonify({'error': 'Email already exists'}), 409
+        cursor.execute("SELECT COUNT(*) FROM users WHERE email = %s;", (data['email'],))
+        count = cursor.fetchone()[0]
+        if count != 0:
+            return jsonify({'error': 'Email already exists'}), 409
 
-    cursor.execute('''
-        INSERT INTO users (login, email, password_hash, countryCode, isPublic, phone, image)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ''', (
-    data['login'], data['email'], hashed_password, data['countryCode'], data['isPublic'], data.get('phone'),
-    data.get('image'), ))
-    conn.commit()
-    cursor.close()
-    print("Пользователь успешно зарегистрирован!")
-    new_user = User(login = data['login'], email=data['email'], password=hashed_password, countryCode=data['countryCode'], isPublic=data['isPublic'])
+        cursor.execute('''
+            INSERT INTO users (login, email, password_hash, countryCode, isPublic, phone, image)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ''', (
+            data['login'], data['email'], hashed_password, data['countryCode'], data['isPublic'], data.get('phone'),
+            data.get('image'),))
+        conn.commit()
+        # print("Пользователь успешно зарегистрирован!")
+    new_user = Profile(login=data['login'], email=data['email'], password=hashed_password, countryCode=data['countryCode'],
+                    isPublic=data['isPublic'])
     return jsonify({
         'login': new_user.login,
         'email': new_user.email,
@@ -451,63 +477,54 @@ def register():
         'phone': new_user.phone,
         'image': new_user.image
     }), 201
-    # except Exception as e:
-    #     cursor.close()
-    #     print("Ошибка при регистрации пользователя:", e)
-    #     return jsonify({'message': 'User registeration failed '}), 500
+
+
 @app.route('/api/auth/sign-in', methods=['POST'])
 def login():
     data = request.get_json()
-    cursor = conn.cursor()
+    with conn.cursor() as cursor:
+        cursor.execute('''
+            SELECT password_hash FROM users WHERE login = %s;
+            ''', (data['login'],))
+        real_pass = cursor.fetchone()
+        if real_pass is None:
+            return jsonify({'message': 'Пользователь с указанным логином не найден'}), 401
+        if authenticate(data['password'], real_pass[0]):
+            # token = jwt.encode(
+            # {'user': data['login'], 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)},
+            # os.getenv('SECRET_KEY'))
+            token = jwt.encode(payload={'sub': data['login']}, key='rqvenrieqfoiejq', algorithm='HS256')
 
-    cursor.execute('''
-        SELECT password_hash FROM users WHERE login = %s;
-        ''', (data['login'], ))
-    real_pass = cursor.fetchone()
-    if real_pass is None:
-        return jsonify({'message': 'Пользователь с указанным логином и паролем не найден'}), 401
-    if authenticate(data['password'], real_pass[0]):
-        token = jwt.encode(
-            {'user': data['login'], 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=30)},
-            os.getenv('SECRET_KEY'))
-        try:
-            cursor.execute('''UPDATE users
-                SET token = %s
-                WHERE login = %s;''', (token, data['login'], ))
-            cursor.close()
-            return jsonify({'token': token}), 200
-        except:
-            cursor.close()
-            return jsonify({'message': 'Token does not saved'}), 200
+            try:
+                cursor.execute('''UPDATE users
+                    SET token = %s
+                    WHERE login = %s;''', (token, data['login'],))
+                return jsonify({'token': token}), 200
+            except Exception as e:
+                return jsonify({'message', 'token saving is failed'}), 404
+        else:
+            return jsonify({'message': 'Wrong password'}), 401
 
-    else:
-        cursor.close()
-        return jsonify({'message': 'Неправильный пароль'}), 401
-
-    # except Exception as e:
-    #     print("Ошибка при аутентификации пользователя:", e)
-    #     return jsonify({'message': 'Could not verify', 'WWW-Authenticate': 'Basic auth="Login required"'}), 401
 
 @app.route('/api/me/profile', methods=['POST'])
 def get_profile():
     data = request.get_json()
-    cursor = conn.cursor()
-    if data.get('token') is None:
-        cursor.close()
-        return jsonify({'message': 'Token is not correct'}), 401
-    cursor.execute('''
-        SELECT EXISTS(SELECT 1 FROM users WHERE token = %s) AS user_exists;
-            ''', (data['token'],))
-    exists = cursor.fetchone()[0]
-    if not exists:
-        cursor.close()
-        return jsonify({'message' : 'Token does not exists'}), 401
-    cursor.execute('''
-    SELECT id, login, email, country_code, is_public, phone, image
-    FROM users
-    WHERE token = %s);''', (data['token'], ))
-    user_data = cursor.fetchall()
-    cursor.close()
-    return jsonify(user_data), 201
+    with conn.cursor() as cursor:
+        if data.get('token') is None:
+            return jsonify({'message': 'Token is null'}), 401
+        cursor.execute('''
+            SELECT EXISTS(SELECT 1 FROM users WHERE token = %s) AS user_exists;
+                ''', (data['token'],))
+        exists = cursor.fetchone()[0]
+        if not exists:
+            return jsonify({'message': 'Token does not exists in database'}), 401
+        cursor.execute('''
+        SELECT id, login, email, country_code, is_public, phone, image
+        FROM users
+        WHERE token = %s);''', (data['token'],))
+        user_data = cursor.fetchall()
+    return jsonify(user_data), 200
+
+
 if __name__ == "__main__":
     app.run()
